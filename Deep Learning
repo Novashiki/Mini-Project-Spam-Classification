@@ -1,0 +1,563 @@
+# ============================================================
+#  Spam Detection - All 4 Models (PyTorch)
+#  Models: CNN | LSTM | BiLSTM | CNN+LSTM
+#  Dataset: SMS Spam Collection (from base_data_pipeline.py)
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from collections import Counter
+import re
+import time
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, precision_score,
+                             recall_score, f1_score, confusion_matrix,
+                             roc_curve, auc)
+
+# ── reproducibility ──────────────────────────────────────────
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# ── hyperparameters ──────────────────────────────────────────
+DATA_URL      = "https://raw.githubusercontent.com/justmarkham/pycon-2016-tutorial/master/data/sms.tsv"
+MAX_VOCAB     = 10_000
+MAX_LEN       = 100
+EMBED_DIM     = 128
+HIDDEN_DIM    = 128
+NUM_FILTERS   = 128
+KERNEL_SIZES  = [3, 4, 5]
+DROPOUT       = 0.5
+BATCH_SIZE    = 64
+EPOCHS        = 10
+LR            = 1e-3
+DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SAVE_DIR      = "saved_models"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+print(f"Using device: {DEVICE}")
+
+# ════════════════════════════════════════════════════════════
+# 1.  DATA PIPELINE  (mirrors base_data_pipeline.py)
+# ════════════════════════════════════════════════════════════
+
+def load_dataset() -> pd.DataFrame:
+    df = pd.read_csv(DATA_URL, sep="\t", names=["label", "message"])
+    return df
+
+def preprocess_labels(df) -> pd.DataFrame:
+    df["label"] = df["label"].map({"ham": 0, "spam": 1})
+    return df
+
+def split_data(df, test_size=0.2, random_state=42):
+    X = df["message"]
+    y = df["label"]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=random_state
+    )
+    return X_train, X_test, y_train, y_test
+
+def get_processed_data():
+    df = load_dataset()
+    df = preprocess_labels(df)
+    return split_data(df)
+
+# ════════════════════════════════════════════════════════════
+# 2.  TEXT PREPROCESSING  (tokeniser + vocab + padding)
+# ════════════════════════════════════════════════════════════
+
+def tokenise(text: str):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    return text.split()
+
+class Vocabulary:
+    PAD, UNK = "<PAD>", "<UNK>"
+
+    def __init__(self, max_size=MAX_VOCAB):
+        self.max_size  = max_size
+        self.word2idx  = {self.PAD: 0, self.UNK: 1}
+        self.idx2word  = {0: self.PAD, 1: self.UNK}
+
+    def build(self, texts):
+        counter = Counter(tok for txt in texts for tok in tokenise(txt))
+        for word, _ in counter.most_common(self.max_size - 2):
+            idx = len(self.word2idx)
+            self.word2idx[word] = idx
+            self.idx2word[idx]  = word
+        return self
+
+    def encode(self, text, max_len=MAX_LEN):
+        tokens = tokenise(text)[:max_len]
+        ids    = [self.word2idx.get(t, 1) for t in tokens]
+        ids   += [0] * (max_len - len(ids))   # pad
+        return ids
+
+    def __len__(self):
+        return len(self.word2idx)
+
+class SMSDataset(Dataset):
+    def __init__(self, texts, labels, vocab: Vocabulary):
+        self.texts  = [torch.tensor(vocab.encode(t), dtype=torch.long) for t in texts]
+        self.labels = [torch.tensor(l, dtype=torch.float32) for l in labels]
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx], self.labels[idx]
+
+# ════════════════════════════════════════════════════════════
+# 3.  MODEL DEFINITIONS
+# ════════════════════════════════════════════════════════════
+
+# ── 3a. CNN ──────────────────────────────────────────────────
+class CNNClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_filters, kernel_sizes, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.convs     = nn.ModuleList([
+            nn.Conv1d(embed_dim, num_filters, k) for k in kernel_sizes
+        ])
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(num_filters * len(kernel_sizes), 1)
+
+    def forward(self, x):
+        x = self.embedding(x).permute(0, 2, 1)          # (B, E, L)
+        pooled = [torch.relu(conv(x)).max(dim=2).values  # (B, F)
+                  for conv in self.convs]
+        x = torch.cat(pooled, dim=1)                     # (B, F*K)
+        x = self.dropout(x)
+        return self.fc(x).squeeze(1)
+
+# ── 3b. LSTM ─────────────────────────────────────────────────
+class LSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm      = nn.LSTM(embed_dim, hidden_dim, batch_first=True,
+                                 num_layers=2, dropout=dropout)
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        _, (h, _) = self.lstm(x)
+        h = self.dropout(h[-1])
+        return self.fc(h).squeeze(1)
+
+# ── 3c. BiLSTM ───────────────────────────────────────────────
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.bilstm    = nn.LSTM(embed_dim, hidden_dim, batch_first=True,
+                                 num_layers=2, dropout=dropout, bidirectional=True)
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        _, (h, _) = self.bilstm(x)
+        # concat last forward + last backward hidden states
+        h = torch.cat([h[-2], h[-1]], dim=1)
+        h = self.dropout(h)
+        return self.fc(h).squeeze(1)
+
+# ── 3d. CNN + LSTM ───────────────────────────────────────────
+class CNNLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_filters,
+                 kernel_size, hidden_dim, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.conv      = nn.Conv1d(embed_dim, num_filters, kernel_size,
+                                   padding=kernel_size // 2)
+        self.lstm      = nn.LSTM(num_filters, hidden_dim, batch_first=True,
+                                 num_layers=1)
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = self.embedding(x).permute(0, 2, 1)       # (B, E, L)
+        x = torch.relu(self.conv(x)).permute(0, 2, 1) # (B, L, F)
+        _, (h, _) = self.lstm(x)
+        h = self.dropout(h[-1])
+        return self.fc(h).squeeze(1)
+
+# ════════════════════════════════════════════════════════════
+# 4.  TRAINING & EVALUATION UTILITIES  (evaluation_utils.py)
+# ════════════════════════════════════════════════════════════
+
+def evaluate_model(true_labels, predictions):
+    return {
+        "Accuracy":         accuracy_score(true_labels, predictions),
+        "Precision":        precision_score(true_labels, predictions, zero_division=0),
+        "Recall":           recall_score(true_labels, predictions, zero_division=0),
+        "F1 Score":         f1_score(true_labels, predictions, zero_division=0),
+        "Confusion Matrix": confusion_matrix(true_labels, predictions),
+    }
+
+def train_one_epoch(model, loader, criterion, optimiser):
+    model.train()
+    total_loss, correct, total = 0, 0, 0
+    for X, y in loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        optimiser.zero_grad()
+        out  = model(X)
+        loss = criterion(out, y)
+        loss.backward()
+        optimiser.step()
+        total_loss += loss.item() * len(y)
+        preds       = (torch.sigmoid(out) >= 0.5).long()
+        correct    += (preds == y.long()).sum().item()
+        total      += len(y)
+    return total_loss / total, correct / total
+
+@torch.no_grad()
+def evaluate_epoch(model, loader, criterion):
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    all_preds, all_true, all_probs = [], [], []
+    for X, y in loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        out  = model(X)
+        loss = criterion(out, y)
+        total_loss += loss.item() * len(y)
+        preds       = (torch.sigmoid(out) >= 0.5).long()
+        correct    += (preds == y.long()).sum().item()
+        total      += len(y)
+        all_preds.extend(preds.cpu().numpy())
+        all_true.extend(y.cpu().long().numpy())
+        all_probs.extend(torch.sigmoid(out).cpu().numpy())
+    return total_loss / total, correct / total, all_preds, all_true, all_probs
+
+def run_training(model, train_loader, test_loader, name):
+    criterion = nn.BCEWithLogitsLoss()
+    optimiser = optim.Adam(model.parameters(), lr=LR)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=2, factor=0.5)
+
+    history = {"train_loss": [], "val_loss": [],
+               "train_acc":  [], "val_acc":  []}
+
+    print(f"\n{'='*55}")
+    print(f"  Training: {name}")
+    print(f"{'='*55}")
+    print(f"{'Epoch':>6}  {'TrLoss':>8}  {'TrAcc':>7}  {'VaLoss':>8}  {'VaAcc':>7}")
+    print(f"{'-'*55}")
+
+    t0 = time.time()
+    for epoch in range(1, EPOCHS + 1):
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimiser)
+        va_loss, va_acc, _, _, _ = evaluate_epoch(model, test_loader, criterion)
+        scheduler.step(va_loss)
+
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(va_loss)
+        history["train_acc"].append(tr_acc)
+        history["val_acc"].append(va_acc)
+
+        print(f"{epoch:>6}  {tr_loss:>8.4f}  {tr_acc:>6.2%}  {va_loss:>8.4f}  {va_acc:>6.2%}")
+
+    elapsed = time.time() - t0
+    print(f"\n  Done in {elapsed:.1f}s")
+
+    # save model
+    path = os.path.join(SAVE_DIR, f"{name.replace(' ', '_').replace('+','_')}.pt")
+    torch.save(model.state_dict(), path)
+    print(f"  Saved → {path}")
+
+    # final predictions
+    _, _, preds, true, probs = evaluate_epoch(model, test_loader, criterion)
+    metrics = evaluate_model(true, preds)
+    metrics["Training Time (s)"] = round(elapsed, 1)
+
+    return history, metrics, true, preds, probs
+
+# ════════════════════════════════════════════════════════════
+# 5.  PLOTTING
+# ════════════════════════════════════════════════════════════
+
+COLORS = {
+    "CNN":      "#4C72B0",
+    "LSTM":     "#DD8452",
+    "BiLSTM":   "#55A868",
+    "CNN+LSTM": "#C44E52",
+}
+
+def plot_training_curves(all_histories, model_names):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Training Curves — All Models", fontsize=16, fontweight="bold", y=1.01)
+
+    for ax_row, metric_pair, titles in zip(
+        axes,
+        [("train_loss", "val_loss"), ("train_acc", "val_acc")],
+        [("Training Loss", "Validation Loss"), ("Training Accuracy", "Validation Accuracy")]
+    ):
+        for ax, key, title in zip(ax_row, metric_pair, titles):
+            for name, hist in zip(model_names, all_histories):
+                ax.plot(range(1, EPOCHS + 1), hist[key],
+                        label=name, color=COLORS[name], linewidth=2,
+                        marker="o", markersize=4)
+            ax.set_title(title, fontsize=13)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss" if "loss" in key else "Accuracy")
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+            if "acc" in key:
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+
+    plt.tight_layout()
+    plt.savefig("training_curves.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → training_curves.png")
+
+def plot_confusion_matrices(all_true, all_preds, model_names):
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+    fig.suptitle("Confusion Matrices", fontsize=15, fontweight="bold")
+
+    for ax, name, true, preds in zip(axes, model_names, all_true, all_preds):
+        cm = confusion_matrix(true, preds)
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                    xticklabels=["Ham", "Spam"],
+                    yticklabels=["Ham", "Spam"],
+                    linewidths=0.5, linecolor="white",
+                    annot_kws={"size": 14})
+        ax.set_title(name, fontsize=13, fontweight="bold", color=COLORS[name])
+        ax.set_xlabel("Predicted", fontsize=10)
+        ax.set_ylabel("Actual", fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig("confusion_matrices.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → confusion_matrices.png")
+
+def plot_metrics_bar(all_metrics, model_names):
+    metrics_to_plot = ["Accuracy", "Precision", "Recall", "F1 Score"]
+    x = np.arange(len(metrics_to_plot))
+    width = 0.18
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    for i, (name, m) in enumerate(zip(model_names, all_metrics)):
+        vals = [m[k] for k in metrics_to_plot]
+        bars = ax.bar(x + i * width, vals, width, label=name,
+                      color=COLORS[name], alpha=0.85, edgecolor="white")
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.005,
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels(metrics_to_plot, fontsize=12)
+    ax.set_ylim(0, 1.08)
+    ax.set_ylabel("Score", fontsize=12)
+    ax.set_title("Model Performance Comparison", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+
+    plt.tight_layout()
+    plt.savefig("metrics_comparison.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → metrics_comparison.png")
+
+def plot_model_summary_table(all_metrics, model_names):
+    cols   = ["Model", "Accuracy", "Precision", "Recall", "F1 Score",
+              "TP", "TN", "FP", "FN", "Time (s)"]
+    rows   = []
+    for name, m in zip(model_names, all_metrics):
+        cm = m["Confusion Matrix"]
+        tn, fp, fn, tp = cm.ravel()
+        rows.append([
+            name,
+            f"{m['Accuracy']:.4f}",
+            f"{m['Precision']:.4f}",
+            f"{m['Recall']:.4f}",
+            f"{m['F1 Score']:.4f}",
+            tp, tn, fp, fn,
+            m['Training Time (s)']
+        ])
+
+    fig, ax = plt.subplots(figsize=(16, 2.5))
+    ax.axis("off")
+    tbl = ax.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 2.2)
+
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#1F3864")
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            model_col = rows[r - 1][0]
+            cell.set_facecolor(COLORS.get(model_col, "#FFFFFF") + "22")
+        cell.set_edgecolor("#DDDDDD")
+
+    plt.title("Model Comparison Summary Table", fontsize=13,
+              fontweight="bold", pad=10)
+    plt.tight_layout()
+    plt.savefig("summary_table.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → summary_table.png")
+
+def plot_radar_chart(all_metrics, model_names):
+    cats   = ["Accuracy", "Precision", "Recall", "F1 Score"]
+    N      = len(cats)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(7, 7),
+                           subplot_kw=dict(polar=True))
+
+    for name, m in zip(model_names, all_metrics):
+        vals = [m[c] for c in cats] + [m[cats[0]]]
+        ax.plot(angles, vals, linewidth=2, label=name, color=COLORS[name])
+        ax.fill(angles, vals, alpha=0.08, color=COLORS[name])
+
+    ax.set_thetagrids(np.degrees(angles[:-1]), cats, fontsize=12)
+    ax.set_ylim(0.8, 1.0)
+    ax.set_title("Radar Chart — Model Comparison",
+                 fontsize=14, fontweight="bold", pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.1), fontsize=10)
+    ax.grid(color="grey", linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig("radar_chart.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → radar_chart.png")
+
+def plot_roc_auc(all_true, all_probs, model_names):
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    for name, true, probs in zip(model_names, all_true, all_probs):
+        fpr, tpr, _ = roc_curve(true, probs)
+        roc_auc     = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color=COLORS[name], linewidth=2.5,
+                label=f"{name}  (AUC = {roc_auc:.4f})")
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1.2, label="Random Classifier")
+    ax.fill_between([0, 1], [0, 1], alpha=0.05, color="grey")
+
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.02])
+    ax.set_xlabel("False Positive Rate", fontsize=13)
+    ax.set_ylabel("True Positive Rate", fontsize=13)
+    ax.set_title("ROC Curve — All Models", fontsize=15, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=11, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("roc_auc_curve.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → roc_auc_curve.png")
+
+
+    times  = [m["Training Time (s)"] for m in all_metrics]
+    colors = [COLORS[n] for n in model_names]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(model_names, times, color=colors, alpha=0.85,
+                  edgecolor="white", width=0.5)
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.5,
+                f"{t}s", ha="center", fontsize=11, fontweight="bold")
+
+    ax.set_ylabel("Seconds", fontsize=12)
+    ax.set_title("Training Time per Model", fontsize=14, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, max(times) * 1.25)
+
+    plt.tight_layout()
+    plt.savefig("training_time.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved → training_time.png")
+
+# ════════════════════════════════════════════════════════════
+# 6.  MAIN
+# ════════════════════════════════════════════════════════════
+
+def main():
+    # ── load & split data ────────────────────────────────────
+    print("\n[1/6]  Loading dataset …")
+    X_train, X_test, y_train, y_test = get_processed_data()
+    print(f"  Train: {len(X_train)}  |  Test: {len(X_test)}")
+    print(f"  Spam ratio (test): {y_test.mean():.2%}")
+
+    # ── build vocab ──────────────────────────────────────────
+    print("\n[2/6]  Building vocabulary …")
+    vocab = Vocabulary(MAX_VOCAB).build(X_train)
+    print(f"  Vocab size: {len(vocab)}")
+
+    # ── dataloaders ──────────────────────────────────────────
+    print("\n[3/6]  Creating dataloaders …")
+    train_ds = SMSDataset(X_train.tolist(), y_train.tolist(), vocab)
+    test_ds  = SMSDataset(X_test.tolist(),  y_test.tolist(),  vocab)
+    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True)
+    test_loader  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False)
+
+    # ── build models ─────────────────────────────────────────
+    V = len(vocab)
+    models_cfg = [
+        ("CNN", CNNClassifier(V, EMBED_DIM, NUM_FILTERS, KERNEL_SIZES, DROPOUT)),
+        ("LSTM", LSTMClassifier(V, EMBED_DIM, HIDDEN_DIM, DROPOUT)),
+        ("BiLSTM", BiLSTMClassifier(V, EMBED_DIM, HIDDEN_DIM, DROPOUT)),
+        ("CNN+LSTM", CNNLSTMClassifier(V, EMBED_DIM, NUM_FILTERS, 3, HIDDEN_DIM, DROPOUT)),
+    ]
+
+    # ── train all models ─────────────────────────────────────
+    print("\n[4/6]  Training all models …")
+    all_histories, all_metrics, all_true, all_preds, all_probs = [], [], [], [], []
+    model_names = []
+
+    for name, model in models_cfg:
+        model = model.to(DEVICE)
+        hist, metrics, true, preds, probs = run_training(model, train_loader, test_loader, name)
+        all_histories.append(hist)
+        all_metrics.append(metrics)
+        all_true.append(true)
+        all_preds.append(preds)
+        all_probs.append(probs)
+        model_names.append(name)
+
+    # ── print final comparison ───────────────────────────────
+    print("\n[5/6]  Final Results")
+    print(f"\n{'Model':<12} {'Accuracy':>9} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Time':>8}")
+    print("-" * 60)
+    for name, m in zip(model_names, all_metrics):
+        print(f"{name:<12} {m['Accuracy']:>9.4f} {m['Precision']:>10.4f} "
+              f"{m['Recall']:>8.4f} {m['F1 Score']:>8.4f} "
+              f"{m['Training Time (s)']:>7}s")
+
+    # ── plot everything ──────────────────────────────────────
+    print("\n[6/6]  Generating plots …")
+    plot_training_curves(all_histories, model_names)
+    plot_confusion_matrices(all_true, all_preds, model_names)
+    plot_metrics_bar(all_metrics, model_names)
+    plot_model_summary_table(all_metrics, model_names)
+    plot_radar_chart(all_metrics, model_names)
+    plot_training_time(all_metrics, model_names)
+    plot_roc_auc(all_true, all_probs, model_names)
+
+    print("\n✅  All done!  Outputs:")
+    print("   saved_models/   — .pt checkpoints")
+    print("   training_curves.png")
+    print("   confusion_matrices.png")
+    print("   metrics_comparison.png")
+    print("   summary_table.png")
+    print("   radar_chart.png")
+    print("   training_time.png")
+    print("   roc_auc_curve.png")
+
+if __name__ == "__main__":
+    main()
