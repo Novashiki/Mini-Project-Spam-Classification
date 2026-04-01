@@ -1,5 +1,0 @@
-model,accuracy,precision,recall,f1_score,mcc,roc_auc
-Decision Tree,0.9632,0.8462,0.8859,0.8656,0.8446,0.9368
-Random Forest,0.9839,1.0,0.8792,0.9357,0.929,0.9944
-Gradient Boosting,0.9857,0.9586,0.9329,0.9456,0.9374,0.99
-XGBoost,0.9892,0.9928,0.9262,0.9583,0.9529,0.9914
